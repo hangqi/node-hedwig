@@ -17,30 +17,115 @@
 
 #include "hedwig.h"
 #include <iostream>
+#include <log4cxx/logger.h>
+#include <log4cxx/basicconfigurator.h>
+#include <log4cxx/propertyconfigurator.h>
+#include <log4cxx/helpers/exception.h>
 
 #include <hedwig/exceptions.h>
 
+namespace HedwigMessage {
+
+const char K_SRCREGION[] = "srcRegion";
+const char K_BODY[] = "body";
+const char K_MSGID[] = "msgId";
+const char K_LOCALCOMPONENT[] = "localComponent";
+const char K_REMOTECOMPONENTS[] = "remoteComponents";
+const char K_REGION[] = "region";
+const char K_SEQID[] = "seqId";
+
+#define STR_LH(var) \
+String::New(var) 
+
+#define NUM_LH(var) \
+Number::New(var)
+
+static Local<Object> ToJSObject(Hedwig::Message& message) 
+{
+    HandleScope scope;
+    Local<Object> ret = Object::New();
+    if (message.has_srcregion()) {
+        ret->Set(STR_LH(K_SRCREGION), STR_LH(message.srcregion().c_str())); 
+    }
+    if (message.has_body()) {
+        ret->Set(STR_LH(K_BODY), STR_LH(message.body().c_str()));
+    }
+    if (message.has_msgid()) {
+        Local<Object> msgid = Object::New();
+
+        Hedwig::MessageSeqId id = message.msgid();
+        if (id.has_localcomponent()) {
+            msgid->Set(STR_LH(K_LOCALCOMPONENT), NUM_LH(id.localcomponent()));
+        } 
+        int remote_size = id.remotecomponents_size();
+        if (remote_size > 0) {
+            Local<Array> array = Array::New(remote_size);
+            for (int i = 0; i < remote_size; ++i) {
+                Hedwig::RegionSpecificSeqId rid = id.remotecomponents(i);     
+                Local<Object> ridObj = Object::New();
+                if (rid.has_region()) {
+                    ridObj->Set(STR_LH(K_REGION), STR_LH(rid.region().c_str()));
+                }
+                if (rid.has_seqid()) {
+                    ridObj->Set(STR_LH(K_SEQID), NUM_LH(rid.seqid()));    
+                }
+                array->Set(i, ridObj);
+            }
+            msgid->Set(STR_LH(K_REMOTECOMPONENTS), array);
+        }
+        ret->Set(STR_LH(K_MSGID), msgid);
+    }
+    return scope.Close(ret);
+}
+#undef STR_LH 
+#undef NUM_LH
+};
+
 // Hedwig Configuration
-HedwigConfiguration::HedwigConfiguration(const std::string &defaultServer)
-  : defaultServer(defaultServer) {
+HedwigConfiguration::HedwigConfiguration()
+  : strMap(std::map<std::string, std::string>()),
+    boolMap(std::map<std::string, bool>()),
+    intMap(std::map<std::string, int>())
+{}
+
+HedwigConfiguration::~HedwigConfiguration() {
+    strMap.clear();
+    boolMap.clear();
+    intMap.clear();
 }
 
-HedwigConfiguration::~HedwigConfiguration() {}
-
-int HedwigConfiguration::getInt(const std::string& /* key */, int defaultVal) const {
+int HedwigConfiguration::getInt(const std::string& key, int defaultVal) const {
+  std::map<std::string, int>::const_iterator it = intMap.find(key);
+  if (it != intMap.end()) {
+    return it->second;
+  }
   return defaultVal;
 }
 
 const std::string HedwigConfiguration::get(const std::string &key, const std::string &defaultVal) const {
-  if (Configuration::DEFAULT_SERVER == key) {
-    return defaultServer;
-  } else {
-    return defaultVal;
+  std::map<std::string, std::string>::const_iterator it = strMap.find(key);
+  if (it != strMap.end()) {
+    return it->second;
   }
+  return defaultVal;
 }
 
-bool HedwigConfiguration::getBool(const std::string & /*key*/, bool defaultVal) const {
+bool HedwigConfiguration::getBool(const std::string & key, bool defaultVal) const {
+  std::map<std::string, bool>::const_iterator it = boolMap.find(key);
+  if (it != boolMap.end()) {
+    return it->second;
+  }
   return defaultVal;
+}
+
+inline void HedwigConfiguration::setStr(const std::string &key, const std::string &val) {
+    strMap.insert(std::pair<std::string, std::string>(key, val));
+}
+inline void HedwigConfiguration::setInt(const std::string &key, int val) {
+    intMap.insert(std::pair<std::string, int>(key, val));
+}
+inline void HedwigConfiguration::setBool(const std::string &key, bool val) {
+    boolMap.insert(std::pair<std::string, bool>(key, val));
 }
 
 // Hedwig Operation Callback
@@ -62,21 +147,19 @@ void HedwigOperationCallback::operationFailed(const std::exception& exception) {
 void HedwigOperationCallback::doJsCallback(const char* errorMsg) {
   EIOCallback *cb = new EIOCallback();
   cb->rc = 0 == errorMsg ? 0 : -1;
+  cb->errMsg = errorMsg ? strdup(errorMsg) : NULL;
   cb->callback = callback;
 
-  eio_custom(EIO_Callback, EIO_PRI_DEFAULT, EIO_AfterCallback, cb);
-}
-
-void HedwigOperationCallback::EIO_Callback(eio_req *req) {
-  // do nothing
+  eio_nop(EIO_PRI_DEFAULT, EIO_AfterCallback, cb);
 }
 
 int HedwigOperationCallback::EIO_AfterCallback(eio_req *req) {
   HandleScope scope;
   EIOCallback *cb = static_cast<EIOCallback *>(req->data);
+  ev_unref(EV_DEFAULT_UC);
   Local<Value> argv[1];
   if (cb->rc) {
-    argv[0] = V8EXC("Failed");
+    argv[0] = V8EXC(cb->errMsg);
   } else {
     argv[0] = Local<Value>::New(Null());
   }
@@ -107,14 +190,10 @@ void HedwigMessageHandler::consume(const std::string& topic, const std::string& 
   consumeData->callback = jsCallback;
   consumeData->topic = topic;
   consumeData->subscriber = subscriber;
-  consumeData->message = msg.body();
+  consumeData->message = msg;
   consumeData->consumeCb = callback;
 
-  eio_custom(EIO_Consume, EIO_PRI_DEFAULT, EIO_AfterConsume, consumeData);
-}
-
-void HedwigMessageHandler::EIO_Consume(eio_req *req) {
-  // do nothing
+  eio_nop(EIO_PRI_DEFAULT, EIO_AfterConsume, consumeData);
 }
 
 int HedwigMessageHandler::EIO_AfterConsume(eio_req *req) {
@@ -123,7 +202,7 @@ int HedwigMessageHandler::EIO_AfterConsume(eio_req *req) {
   Local<Value> argv[4];
   argv[0] = String::New(consumeData->topic.c_str());
   argv[1] = String::New(consumeData->subscriber.c_str());
-  argv[2] = String::New(consumeData->message.c_str());
+  argv[2] = HedwigMessage::ToJSObject(consumeData->message);
   // wrap callback
   Local<Value> cbArgv[1];
   cbArgv[0] = External::New(&(consumeData->consumeCb));
@@ -231,9 +310,10 @@ void HedwigClient::Init(Handle<Object> target) {
               constructor_template->GetFunction());
 }
 
-HedwigClient::HedwigClient(const std::string &server) : ObjectWrap() {
-  conf = new HedwigConfiguration(server);
+HedwigClient::HedwigClient(HedwigConfiguration* config, const char *log4cxxCfg) : ObjectWrap() {
+  conf = config;
   client = new Hedwig::Client(*conf);
+  log4cxx::PropertyConfigurator::configure(log4cxxCfg);
 }
 
 HedwigClient::~HedwigClient() {
@@ -244,6 +324,7 @@ HedwigClient::~HedwigClient() {
 void HedwigClient::publish(const std::string &topic, const std::string &message, Persistent<Function> jsCallback) {
   Hedwig::OperationCallbackPtr cb(new HedwigOperationCallback(jsCallback));
   client->getPublisher().asyncPublish(topic, message, cb);
+  ev_ref(EV_DEFAULT_UC);
 }
 
 void HedwigClient::subscribe(const std::string &topic, const std::string &subscriberId, 
@@ -251,12 +332,14 @@ void HedwigClient::subscribe(const std::string &topic, const std::string &subscr
                               Persistent<Function> jsCallback) {
   Hedwig::OperationCallbackPtr cb(new HedwigOperationCallback(jsCallback));
   client->getSubscriber().asyncSubscribe(topic, subscriberId, mode, cb);
+  ev_ref(EV_DEFAULT_UC);
 }
 
 void HedwigClient::unsubscribe(const std::string &topic, const std::string &subscriberId,
                                Persistent<Function> jsCallback) {
   Hedwig::OperationCallbackPtr cb(new HedwigOperationCallback(jsCallback));
   client->getSubscriber().asyncUnsubscribe(topic, subscriberId, cb);
+  ev_ref(EV_DEFAULT_UC);
 }
 
 void HedwigClient::closeSubscription(const std::string &topic, const std::string &subscriberId) {
@@ -267,10 +350,12 @@ void HedwigClient::startDelivery(const std::string &topic, const std::string &su
                                  Persistent<Function> jsCallback) {
   Hedwig::MessageHandlerCallbackPtr mcb(new HedwigMessageHandler(jsCallback));
   client->getSubscriber().startDelivery(topic, subscriberId, mcb);
+  ev_ref(EV_DEFAULT_UC);
 }
 
 void HedwigClient::stopDelivery(const std::string &topic, const std::string &subscriberId) {
   client->getSubscriber().stopDelivery(topic, subscriberId);
+  ev_unref(EV_DEFAULT_UC);
 }
 
 /**
@@ -281,15 +366,31 @@ void HedwigClient::stopDelivery(const std::string &topic, const std::string &sub
 Handle<Value> HedwigClient::New(const Arguments& args) {
   HandleScope scope;
 
-  std::string server;
-  if (args[0]->IsString()) {
-    String::Utf8Value host(args[0]->ToString());
-    server = std::string(*host);
+  HedwigConfiguration * config; 
+  REQ_STR_ARG(1, log4xxCfg);
+  if (args[0]->IsObject()) {
+    config = new HedwigConfiguration();
+    Local<Object> obj = args[0]->ToObject();
+    Local<Array> properties = obj->GetPropertyNames();
+    for (int i = 0, length = properties->Length(); i < length; ++i)
+    {
+        Local<Value> key = properties->Get(0);
+        Local<Value> val = obj->Get(key);
+        String::AsciiValue keyStr(key->ToString());
+        if (val->IsString()) {
+            String::Utf8Value valStr(val->ToString());
+            config->setStr(*keyStr, *valStr);
+        } else if (val->IsBoolean()) {
+            config->setBool(*keyStr, val->BooleanValue()); 
+        } else if (val->IsInt32()) {
+            config->setInt(*keyStr, val->Int32Value());
+        }
+    }
   } else {
-    return THREXC("No hostname defined");
+    return THREXC("parameter must be an Object");
   }
-
-  HedwigClient *hedwig = new HedwigClient(server);
+  
+  HedwigClient *hedwig = new HedwigClient(config, *log4xxCfg);
   hedwig->Wrap(args.This());
 
   return args.This();

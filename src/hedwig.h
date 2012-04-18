@@ -24,6 +24,7 @@
 #include <hedwig/client.h>
 
 #include <string>
+#include <map>
 
 #define ADD_PROTOTYPE_METHOD(class, name, method) \
 class ## _ ## name ## _symbol = NODE_PSYMBOL(#name); \
@@ -75,7 +76,16 @@ static Persistent<String> callback_failed_symbol;
 // Callback Wrapper passed to EIO
 struct EIOCallback {
   int rc;
+  char * errMsg;
   Persistent<Function> callback;
+
+  EIOCallback():rc(0),errMsg(NULL) {}
+  ~EIOCallback() {
+    if (errMsg) {
+        delete[] errMsg;
+        errMsg = NULL;
+    } 
+  }
 };
 
 // Hedwig Callback
@@ -89,7 +99,6 @@ public:
 protected:
   void doJsCallback(const char* errorMsg);
 
-  static void EIO_Callback(eio_req *req);
   static int EIO_AfterCallback(eio_req *req);
 private:
   Persistent<Function> callback;
@@ -100,7 +109,7 @@ struct EIOConsumeData {
   Persistent<Function> callback;
   std::string topic;
   std::string subscriber;
-  std::string message;
+  Hedwig::Message message;
   Hedwig::OperationCallbackPtr consumeCb;
 };
 
@@ -112,7 +121,6 @@ public:
 
   virtual void consume(const std::string& topic, const std::string& subscriber, const Hedwig::Message& msg, Hedwig::OperationCallbackPtr& callback);
 
-  static void EIO_Consume(eio_req *req);
   static int EIO_AfterConsume(eio_req *req);
 
 protected:
@@ -143,17 +151,22 @@ private:
 // Hedwig Configuration
 class HedwigConfiguration : public Hedwig::Configuration {
 public:
-  HedwigConfiguration(const std::string &defaultServer);
+  HedwigConfiguration();
   virtual ~HedwigConfiguration();
 
   virtual int getInt(const std::string& key, int defaultVal) const;
 
   virtual const std::string get(const std::string& key, const std::string& defaultVal) const;
 
-  virtual bool getBool(const std::string& /*key*/, bool defaultVal) const;
+  virtual bool getBool(const std::string& key, bool defaultVal) const;
 
+  inline void setStr(const std::string& key, const std::string& value);
+  inline void setInt(const std::string& key, const int value);
+  inline void setBool(const std::string& key, const bool value);
 private:
-  const std::string defaultServer;
+  std::map<std::string, std::string> strMap;
+  std::map<std::string, bool> boolMap;
+  std::map<std::string, int> intMap;
 };
 
 // Hedwig Client
@@ -164,7 +177,7 @@ public:
   static void Init(Handle<Object> target);
 
 protected:
-  HedwigClient(const std::string &server);
+  HedwigClient(HedwigConfiguration*, const char *);
   ~HedwigClient();
 
   void publish(const std::string &topic, const std::string &message,
