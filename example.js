@@ -4,7 +4,6 @@ var options = {
         'hedwig.cpp.default_server': "loalhost:9875:9876",
         'hedwig.cpp.max_msgqueue_size': 20
     };
-//var client = new hedwig.Hedwig("mustlonetaste.peking.corp.yahoo.com:9875:9876");
 
 var client = new hedwig.Hedwig(options, './log4cxx.properties');
 
