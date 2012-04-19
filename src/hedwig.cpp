@@ -21,8 +21,16 @@
 #include <log4cxx/basicconfigurator.h>
 #include <log4cxx/propertyconfigurator.h>
 #include <log4cxx/helpers/exception.h>
+#include <set>
 
 #include <hedwig/exceptions.h>
+
+static log4cxx::LoggerPtr logger(log4cxx::Logger::getLogger("hedwig."__FILE__));
+
+#define NODE_DEFINE_CONSTANT_BY_NAME(target, name, constant)       \
+    (target)->Set(v8::String::NewSymbol(name),  \
+         v8::Integer::New(constant),                 \
+         static_cast<v8::PropertyAttribute>(v8::ReadOnly|v8::DontDelete))
 
 namespace HedwigMessage {
 
@@ -40,6 +48,7 @@ String::New(var)
 #define NUM_LH(var) \
 Number::New(var)
 
+// convert Hedwig::Message (protobuf message) to JS Object 
 static Local<Object> ToJSObject(Hedwig::Message& message) 
 {
     HandleScope scope;
@@ -176,13 +185,36 @@ int HedwigOperationCallback::EIO_AfterCallback(eio_req *req) {
   return 0;
 }
 
+JSCallbackWrapper::JSCallbackWrapper(Persistent<Function> &jsCallback)
+  : jsCallback_(jsCallback),active_(true) {
+}
+
+JSCallbackWrapper::~JSCallbackWrapper() {
+    jsCallback_.Dispose();
+}
+
+inline void JSCallbackWrapper::inActive() {
+    active_ = false;
+}
+
+inline void JSCallbackWrapper::active() {
+    active_ = true;
+}
+
+Local<Value> JSCallbackWrapper::Call(Handle<Object> recv, int argc, Handle<Value> argv[]) {
+    HandleScope scope;
+    if (active_) 
+        return jsCallback_->Call(recv, argc, argv);
+
+    return scope.Close(Undefined());
+}
+
 // Message Handler
-HedwigMessageHandler::HedwigMessageHandler(Persistent<Function> &jsCallback)
+HedwigMessageHandler::HedwigMessageHandler(JSWPtr &jsCallback)
   : jsCallback(jsCallback) {
 }
 
 HedwigMessageHandler::~HedwigMessageHandler() {
-  jsCallback.Dispose();
 }
 
 void HedwigMessageHandler::consume(const std::string& topic, const std::string& subscriber, const Hedwig::Message& msg, Hedwig::OperationCallbackPtr& callback) {
@@ -193,12 +225,17 @@ void HedwigMessageHandler::consume(const std::string& topic, const std::string& 
   consumeData->message = msg;
   consumeData->consumeCb = callback;
 
+  LOG4CXX_INFO(logger, "consume called, start eio: " << consumeData->topic << " " << consumeData->subscriber << consumeData->message.msgid().localcomponent());
   eio_nop(EIO_PRI_DEFAULT, EIO_AfterConsume, consumeData);
+  ev_ref(EV_DEFAULT_UC);
 }
 
 int HedwigMessageHandler::EIO_AfterConsume(eio_req *req) {
   HandleScope scope;
+  ev_unref(EV_DEFAULT_UC);
   EIOConsumeData *consumeData = static_cast<EIOConsumeData *>(req->data);
+    
+  LOG4CXX_INFO(logger, "about consume callback to JS: " << consumeData->topic << " " << consumeData->subscriber << consumeData->message.msgid().localcomponent());
   Local<Value> argv[4];
   argv[0] = String::New(consumeData->topic.c_str());
   argv[1] = String::New(consumeData->subscriber.c_str());
@@ -207,18 +244,19 @@ int HedwigMessageHandler::EIO_AfterConsume(eio_req *req) {
   Local<Value> cbArgv[1];
   cbArgv[0] = External::New(&(consumeData->consumeCb));
   Persistent<Object> jsConsumeCallback(
-    OperationCallbackWrapper::constructor_template->GetFunction()->NewInstance(1, cbArgv));
+          OperationCallbackWrapper::constructor_template->GetFunction()->NewInstance(1, cbArgv));
   argv[3] = Local<Object>::New(jsConsumeCallback);
-  
+
   TryCatch try_catch;
 
   consumeData->callback->Call(Context::GetCurrent()->Global(), 4, argv);
 
   if (try_catch.HasCaught()) {
-    node::FatalException(try_catch);
+      node::FatalException(try_catch);
   }
 
   delete consumeData;
+
   return 0;
 }
 
@@ -305,6 +343,11 @@ void HedwigClient::Init(Handle<Object> target) {
   ADD_PROTOTYPE_METHOD(hedwig, startDelivery, StartDelivery);
   ADD_PROTOTYPE_METHOD(hedwig, stopDelivery, StopDelivery);
 
+  // Exports CONSTANT
+  NODE_DEFINE_CONSTANT_BY_NAME(target, "CREATE", Hedwig::SubscribeRequest::CREATE);
+  NODE_DEFINE_CONSTANT_BY_NAME(target, "ATTACH", Hedwig::SubscribeRequest::ATTACH);
+  NODE_DEFINE_CONSTANT_BY_NAME(target, "CREATE_OR_ATTACH", Hedwig::SubscribeRequest::CREATE_OR_ATTACH);
+
   // Make it visible in Javascript
   target->Set(String::NewSymbol("Hedwig"),
               constructor_template->GetFunction());
@@ -346,16 +389,29 @@ void HedwigClient::closeSubscription(const std::string &topic, const std::string
   client->getSubscriber().closeSubscription(topic, subscriberId);
 }
 
-void HedwigClient::startDelivery(const std::string &topic, const std::string &subscriberId,
+int HedwigClient::startDelivery(const std::string &topic, const std::string &subscriberId,
                                  Persistent<Function> jsCallback) {
-  Hedwig::MessageHandlerCallbackPtr mcb(new HedwigMessageHandler(jsCallback));
+
+  std::map< std::pair<std::string, std::string>, JSWPtr >::iterator it = activedTopicSubscribers.find(std::pair<std::string, std::string>(topic, subscriberId));
+  if (it != activedTopicSubscribers.end()) {
+      return -1;
+  }
+  JSWPtr jcw(new JSCallbackWrapper(jsCallback));
+  Hedwig::MessageHandlerCallbackPtr mcb(new HedwigMessageHandler(jcw));
   client->getSubscriber().startDelivery(topic, subscriberId, mcb);
   ev_ref(EV_DEFAULT_UC);
+  activedTopicSubscribers[std::pair<std::string, std::string>(topic, subscriberId)] = jcw;
+  return 0;
 }
 
 void HedwigClient::stopDelivery(const std::string &topic, const std::string &subscriberId) {
   client->getSubscriber().stopDelivery(topic, subscriberId);
   ev_unref(EV_DEFAULT_UC);
+  std::map< std::pair<std::string, std::string>, JSWPtr>::iterator it = activedTopicSubscribers.find(std::pair<std::string, std::string>(topic, subscriberId));
+  if (it != activedTopicSubscribers.end()) {
+      it->second->inActive();
+      activedTopicSubscribers.erase(it);
+  }
 }
 
 /**
@@ -500,7 +556,19 @@ Handle<Value> HedwigClient::StartDelivery(const Arguments& args) {
 
   HedwigClient *hedwig = OBJUNWRAP<HedwigClient>(args.This());
   Persistent<Function> jsMsgHandler= Persistent<Function>::New(msgHandler);
-  hedwig->startDelivery(*topic, *subscriberId, jsMsgHandler);
+  int rc = hedwig->startDelivery(*topic, *subscriberId, jsMsgHandler);
+      
+  if (rc) {
+      Local<Value> argv[1];
+      argv[0] = V8EXC("already startDelivery");
+      TryCatch try_catch;
+
+      msgHandler->Call(Context::GetCurrent()->Global(), 1, argv);
+
+      if (try_catch.HasCaught()) {
+        node::FatalException(try_catch);
+      }
+  }
   return Undefined();
 }
 
@@ -516,6 +584,7 @@ Handle<Value> HedwigClient::StopDelivery(const Arguments& args) {
 
   HedwigClient *hedwig = OBJUNWRAP<HedwigClient>(args.This());
   hedwig->stopDelivery(*topic, *subscriberId);
+
   return Undefined();
 }
 

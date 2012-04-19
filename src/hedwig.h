@@ -104,9 +104,25 @@ private:
   Persistent<Function> callback;
 };
 
+// a Wrapper for JS callback function
+class JSCallbackWrapper {
+public:
+    JSCallbackWrapper(Persistent<Function> &jsCallback);
+    virtual ~JSCallbackWrapper();
+    Local<Value> Call(Handle<Object> recv, int argc, Handle<Value> argv[]);
+    
+    inline void inActive();
+    inline void active();
+protected:
+    Persistent<Function> jsCallback_;
+    bool active_;
+};
+
+typedef boost::shared_ptr<JSCallbackWrapper> JSWPtr;
+
 // Message Handle Wrapper passed to EIO
 struct EIOConsumeData {
-  Persistent<Function> callback;
+  JSWPtr callback;
   std::string topic;
   std::string subscriber;
   Hedwig::Message message;
@@ -116,7 +132,7 @@ struct EIOConsumeData {
 // Message Handler Callback
 class HedwigMessageHandler : public Hedwig::MessageHandlerCallback {
 public:
-  HedwigMessageHandler(Persistent<Function> &jsCallback);
+  HedwigMessageHandler(JSWPtr &jsCallback);
   virtual ~HedwigMessageHandler();
 
   virtual void consume(const std::string& topic, const std::string& subscriber, const Hedwig::Message& msg, Hedwig::OperationCallbackPtr& callback);
@@ -124,7 +140,7 @@ public:
   static int EIO_AfterConsume(eio_req *req);
 
 protected:
-  Persistent<Function> jsCallback;
+  JSWPtr jsCallback;
 };
 
 // OperationCallback Wrapper
@@ -188,7 +204,7 @@ protected:
   void unsubscribe(const std::string &topic, const std::string &subscriberId,
                    Persistent<Function> jsCallback);
   void closeSubscription(const std::string &topic, const std::string &subscriberId);
-  void startDelivery(const std::string &topic, const std::string &sbuscriberId,
+  int startDelivery(const std::string &topic, const std::string &sbuscriberId,
                      Persistent<Function> jsCallback);
   void stopDelivery(const std::string &topic, const std::string &subscriberId);
 
@@ -207,6 +223,22 @@ protected:
 private:
   Hedwig::Client *client;
   Hedwig::Configuration *conf;
+
+/** 
+ * activedTopicSubscribers -- record all the active subscribers, which called 
+ * StartDelivery(topic, subId), but not StopDelivery(topic, subId)
+ * when a subscriber called StartDelivery(topic, subId), an new entry will be added into 
+ * this map if there does not exist entry(topic, subId), otherwise the StartDelivery 
+ * operation will fail when a subscriber called StopDelivery(topic, subId), the 
+ * entry(topic, subId) will be removed from the map
+ *
+ * The reason we need this map is that, when app calls StartDelivery(topic, subId, callback), a new messageHandler instance will be created, 
+ * and keep the JS callback in it. When app calls StopDelivery(topic, subId), hedwig c++ client will delete the associated messageHandler, and
+ * stop calling consume function in messageHandler. But because the when hedwig c++ client calls the consume function, the messageHandler will send 
+ * out an eio opartion to call JS callback, which will result in when the StopDelivery is called, there are some eio operation pending on the eio queue
+ * and those eio operation should not be called to JS
+ */
+  std::map< std::pair<std::string, std::string>, JSWPtr> activedTopicSubscribers;
 };
 
 #endif // NODE_HEDWIG_H_
