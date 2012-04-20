@@ -1,13 +1,23 @@
-var hedwig = require('./build/Release/hedwig.node');
+var hedwig = require('./build/default/hedwig.node');
 
-var client = new hedwig.Hedwig("localhost:4081:9876");
+var options = {
+        'hedwig.cpp.default_server': "loalhost:9875:9876",
+        'hedwig.cpp.max_msgqueue_size': 20
+    };
 
-var topic = 'mytopic';
-var subId = 'mysub-7';
+var client = new hedwig.Hedwig(options, './log4cxx.properties');
 
+var topic = 'topic_f';
+var subId = 'sub_f';
+
+var cnt = 0;
 var msgHandler = function(thisTopic, thisSub, message, consumeCb) {
-    console.log('Received message : ' + message);
+    cnt += 1;
+    console.log('Received message : ' + JSON.stringify(message));
     consumeCb.complete();
+    if (cnt == 10) {
+        client.stopDelivery(thisTopic, thisSub);
+    }
 };
 
 var pubCb = function(error) {
@@ -17,6 +27,9 @@ var pubCb = function(error) {
         console.log('pub succeed !');
     }
 };
+
+
+console.log(">>>> client start ... ");
 
 client.sub(topic, subId, 2, function(error) {
     if (error) {
@@ -29,3 +42,4 @@ client.sub(topic, subId, 2, function(error) {
         }
     }
 });
+
