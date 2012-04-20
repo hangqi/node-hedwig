@@ -24,7 +24,9 @@
 #include <hedwig/client.h>
 
 #include <string>
+#include <queue>
 #include <map>
+#include <pthread.h>
 
 #define ADD_PROTOTYPE_METHOD(class, name, method) \
 class ## _ ## name ## _symbol = NODE_PSYMBOL(#name); \
@@ -137,10 +139,18 @@ public:
 
   virtual void consume(const std::string& topic, const std::string& subscriber, const Hedwig::Message& msg, Hedwig::OperationCallbackPtr& callback);
 
-  static int EIO_AfterConsume(eio_req *req);
+  static void AfterConsume(EV_P_ ev_async *watcher, int revents);
+
+  static void Init();
 
 protected:
   JSWPtr jsCallback;
+
+  // ev_async for consume called in hedwig thread to main ev loop
+  static ev_async ev_hedwig_consume_notifier;
+  // message queue, and related lock
+  static std::queue<EIOConsumeData*> req_msg_queue;
+  static pthread_mutex_t queue_mutex;
 };
 
 // OperationCallback Wrapper
