@@ -11,9 +11,9 @@ A nodejs client for [Hedwig](http://zookeeper.apache.org/bookkeeper/), which is 
 Create a hedwig client: Hedwig(options, log4j_properties_file_path)
 - param: JSON Object. Configuration settings used to construct a hedwig client.
 - param: String. Log4cxx properties file path.
-
+<pre>
     var client = new hedwig.Hedwig(options, './log4cxx.properties');
-
+</pre>
 Construct an operation callback: function(error)
 - param: String. Error message, if operation succeed, error is null. otherwise, it returns the error message.
 
